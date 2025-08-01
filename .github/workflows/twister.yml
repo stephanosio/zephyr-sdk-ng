@@ -1,0 +1,317 @@
+name: Twister
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk-build-job-id:
+        description: 'SDK Build Job ID'
+        required: true
+      sdk-bundle-basename:
+        description: 'SDK Bundle Base Name'
+        required: true
+        default: 'zephyr-sdk-VER'
+      sdk-toolchain:
+        description: 'SDK Toolchain'
+        type: choice
+        required: true
+        options:
+        - gnu
+        - llvm
+        default: gnu
+      zephyr-ref:
+        description: 'Zephyr Ref (branch, tag, SHA ...)'
+        required: true
+        default: collab-sdk-dev
+      host:
+        description: 'Host'
+        type: choice
+        required: true
+        options:
+        - linux-x86_64
+        - linux-aarch64
+        - macos-x86_64
+        - macos-aarch64
+        - windows-x86_64
+        default: linux-x86_64
+      twister-mode:
+        description: 'Twister Mode'
+        type: choice
+        required: true
+        options:
+        - integration
+        - all
+        default: integration
+      twister-extra-args:
+        description: 'Twister Extra Arguments'
+        required: true
+        default: '--build-only --show-footprint'
+      subset-count:
+        description: 'Subset Count'
+        required: false
+
+concurrency:
+  group: ${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prep:
+    name: Prep
+    runs-on: ubuntu-24.04
+
+    outputs:
+      runner: ${{ steps.plan.outputs.runner }}
+      subset: ${{ steps.plan.outputs.subset }}
+      size: ${{ steps.plan.outputs.size }}
+
+    steps:
+    - name: Plan
+      id: plan
+      run: |
+        # Resolve runner type
+        case "${{ github.event.inputs.host }}" in
+          linux-x86_64)   runner="zephyr-runner-v2-linux-x64-4xlarge";;
+          linux-aarch64)  runner="zephyr-runner-v2-linux-arm64-4xlarge";;
+          macos-x86_64)   runner="zephyr-runner-v2-macos-arm64-2xlarge";;
+          macos-aarch64)  runner="zephyr-runner-v2-macos-arm64-2xlarge";;
+          windows-x86_64) runner="zephyr-runner-v2-windows-x64-2xlarge";;
+        esac
+
+        # Resolve subset count
+        if [ "${{ github.event.inputs.subset-count }}" != "" ]; then
+          size="${{ github.event.inputs.subset_count }}"
+        else
+          case "${{ github.event.inputs.twister-mode }}" in
+            integration) size="20";;
+            all)         size="200";;
+          esac
+        fi
+
+        subset="[ $(seq -s',' 1 ${size}) ]"
+
+        # Export output variables
+        echo "runner=${runner}" >> $GITHUB_OUTPUT
+        echo "subset=${subset}" >> $GITHUB_OUTPUT
+        echo "size=${size}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.subset }})
+    needs: [ plan ]
+    runs-on:
+      group: ${{ needs.prep.outputs.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        subset: ${{ needs.prep.outputs.subset }}
+
+    steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        # Force Python 3.10, which is the minimum Python version supported by
+        # Zephyr and intended to be used with Zephyr SDK.
+        python-version: '3.10'
+
+    - name: Set up test environment (Linux)
+      if: ${{ runner.os == 'Linux' }}
+      run: |
+        # Install required system packages
+        sudo apt-get update
+        sudo apt-get install -y dos2unix jq
+
+        # Set environment variables
+        echo "TAR=tar" >> $$GITHUB_ENV
+
+    - name: Set up test environment (macOS)
+      if: ${{ runner.os == 'macOS' }}
+      run: |
+        # Set environment variables
+        echo "TAR=gtar" >> $GITHUB_ENV
+
+    - name: Set up test environment (Windows)
+      if: ${{ runner.os == 'Windows' }}
+      run: |
+        # Install required system packages
+        choco install ccache dtc-msys2 gperf jq ninja wget 7zip
+
+        # Enable long paths support for Git
+        git config --system core.longpaths true
+
+    - name: Create Python virtual environment
+      run: |
+        # Create Python virtual environment
+        python3 -m venv ${GITHUB_WORKSPACE}/venv
+
+        # Resolve activation script path
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          VENV_ACTIVATE="${GITHUB_WORKSPACE}/venv/Scripts/activate"
+        else
+          VENV_ACTIVATE="${GITHUB_WORKSPACE}/venv/bin/activate"
+        fi
+
+        # Test Python virtual environment
+        source ${VENV_ACTIVATE}
+        which python3
+        which pip3
+
+        # Install core components
+        python3 -m pip install --upgrade pip
+        pip3 install --upgrade setuptools wheel
+
+        # Set environment variables
+        echo "VENV=${GITHUB_WORKSPACE}/venv" >> $GITHUB_ENV
+        echo "VENV_ACTIVATE=${VENV_ACTIVATE}" >> $GITHUB_ENV
+
+    - name: Resolve distribution bundle name
+      run: |
+        BUNDLE_DIR="${{ github.event.inputs.sdk-bundle-basename }}"
+        BUNDLE_NAME="${BUNDLE_DIR}_${{ github.event.inputs.host }}"
+        BUNDLE_FILE="${BUNDLE_NAME}_${{ github.event.inputs.sdk-toolchain }}"
+
+        if [ "${{ github.event.inputs.host }}" == "windows-x86_64" ]; then
+          BUNDLE_EXT="7z"
+        else
+          BUNDLE_EXT="tar.xz"
+        fi
+
+        echo "BUNDLE_DIR=${BUNDLE_DIR}" >> $GITHUB_ENV
+        echo "BUNDLE_NAME=${BUNDLE_NAME}" >> $GITHUB_ENV
+        echo "BUNDLE_FILE=${BUNDLE_FILE}" >> $GITHUB_ENV
+        echo "BUNDLE_EXT=${BUNDLE_EXT}" >> $GITHUB_ENV
+
+    - name: Download distribution bundle
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ env.BUNDLE_NAME }}
+        path: artifacts
+
+    - name: Install distribution bundle
+      run: |
+        # Create tools directory
+        mkdir -p tools
+
+        # Verify distribution bundle archive checksum
+        pushd artifacts
+        md5sum --check md5.sum
+        sha256sum --check sha256.sum
+        popd
+
+        # Extract distribution bundle archive
+        if [ "${BUNDLE_EXT}" == "tar.xz" ]; then
+          ${TAR} -Jxvf artifacts/${BUNDLE_FILE}.${BUNDLE_EXT} -C tools
+        elif [ "${BUNDLE_EXT}" == "7z" ]; then
+          7z x -otools artifacts/${BUNDLE_FILE}.${BUNDLE_EXT}
+        fi
+
+        # Run setup script
+        pushd tools/${BUNDLE_DIR}
+
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          # Shorten distribution bundle path on Windows
+          subst s: ${PWD}
+          pushd /s
+          # NOTE: Escape forward slashes because MinGW (bash)
+          # NOTE: A full path (using PWD) must be specified to ensure that the
+          #       setup script is launched from the shortened path.
+          if [ "${{ matrix.toolchain }}" == "gnu" ]; then
+            ${PWD}/setup.cmd //t all //h //c
+          elif [ "${{ matrix.toolchain }}" == "llvm" ]; then
+            ${PWD}/setup.cmd //l //h //c
+          fi
+          popd
+        else
+          if [ "${{ matrix.toolchain }}" == "gnu" ]; then
+            ./setup.sh -t all -h -c
+          elif [ "${{ matrix.toolchain }}" == "llvm" ]; then
+            ./setup.sh -l -h -c
+          fi
+        fi
+
+        # Clean up bundle archive to reduce disk usage
+        rm -f ${ARTIFACT_ROOT}/${BUNDLE_FILE}
+
+        popd
+
+    - name: Install west
+      run: |
+        # Activate Python virtual environment
+        source ${VENV_ACTIVATE}
+
+        # Install or upgrade west
+        pip3 install --upgrade west
+
+    - name: Set up Zephyr repository
+      run: |
+        # Activate Python virtual environment
+        source ${VENV_ACTIVATE}
+
+        # Create Zephyr workspace
+        ZEPHYR_WORKSPACE=${GITHUB_WORKSPACE}/zephyrproject
+        west init ${ZEPHYR_WORKSPACE}
+        cd ${ZEPHYR_WORKSPACE}
+
+        # Check out specified Zephyr ref
+        pushd zephyr
+        git fetch origin ${{ github.event.inputs.zephyr-ref }}
+        git checkout FETCH_HEAD
+        popd
+
+        # Clone Zephyr repositories
+        west update
+        west zephyr-export
+
+        # Export variables
+        echo "ZEPHYR_WORKSPACE=${ZEPHYR_WORKSPACE}" >> $GITHUB_ENV
+        echo "ZEPHYR_ROOT=${ZEPHYR_WORKSPACE}/zephyr" >> $GITHUB_ENV
+
+    - name: Install Python dependencies
+      run: |
+        # Activate Python virtual environment
+        source ${VENV_ACTIVATE}
+
+        # Install Python dependencies from the checked out Zephyr repository.
+        pip3 install -r ${ZEPHYR_ROOT}/scripts/requirements.txt
+
+    - name: Run test suites
+      run: |
+        # Activate Python virtual environment
+        source ${VENV_ACTIVATE}
+
+        # Create working directory
+        mkdir -p test
+        cd test
+
+        # Set host-specific twister parameters
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          # Shorten twister output paths on Windows in order to work around the
+          # long path issues
+          HOST_ARGS+="--short-build-path "
+        fi
+
+        # Set toolchain variant
+        export ZEPHYR_TOOLCHAIN_VARIANT="zephyr/${{ github.event.input.sdk-toolchain }}"
+
+        # Run tests with twister
+        TWISTER="${ZEPHYR_ROOT}/scripts/twister"
+
+        ${TWISTER} \
+          -v \
+          -N \
+          -M \
+          --force-color \
+          --inline-logs \
+          --retry-failed 3 \
+          --retry-build-errors \
+          --force-toolchain \
+          --no-detailed-test-id \
+          --subset ${{ matrix.subset }}/${{ needs.prep.outputs.size }} \
+          ${HOST_ARGS} \
+          ${{ github.event.input.twister-extra-args }}
+
+    - name: Publish test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: twister_result_subset_${{ matrix.subset }}
+        if-no-files-found: ignore
+        path: test/twister-out/twister.xml
